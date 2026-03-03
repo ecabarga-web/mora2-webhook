@@ -85,7 +85,8 @@ export default async function handler(req, res) {
     const total = parseFloat(order.total_price || order.total_cart_price || 0);
 
     // Método de pago
-    const paymentMethod = order.payment_gateway || 'manual';
+    const gwMap = { manual: 'transferencia', paypal: 'paypal', stripe: 'tarjeta' };
+    const paymentMethod = gwMap[order.payment_gateway] || order.payment_gateway || 'transferencia';
 
     // Line items
     const lineItems = order.line_items || [];
