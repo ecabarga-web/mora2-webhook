@@ -1,11 +1,7 @@
 // api/webhook.js
-// Vercel Serverless Function
-// Recibe pedidos de GHL y los sincroniza con Supabase
-
 const SUPA_URL     = process.env.SUPA_URL;
 const SUPA_SERVICE = process.env.SUPA_SERVICE_KEY;
 
-// ─── Helper: fetch a Supabase ─────────────────────────────
 async function supa(path, opts = {}) {
   const res = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
     headers: {
@@ -24,52 +20,40 @@ async function supa(path, opts = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// ─── Descuenta stock en tabla items ──────────────────────
 async function descontarStock(sku, qty) {
-  // Buscar item por SKU base (sin talla, para agrupar)
-  // SKU GHL puede venir como "MR2-RD-BLC-M-D001" o solo nombre
   const items = await supa(`items?sku=eq.${encodeURIComponent(sku)}&select=id,sku,quantity`);
-  
   if (!items || items.length === 0) {
     console.warn(`SKU no encontrado: ${sku}`);
     return false;
   }
-
   const item = items[0];
   const newQty = Math.max(0, (item.quantity || 0) - qty);
-
   await supa(`items?id=eq.${item.id}`, {
     method: 'PATCH',
     body: JSON.stringify({ quantity: newQty })
   });
-
-  // Registrar movimiento en inventory_movements si existe
   try {
     await supa('inventory_movements', {
       method: 'POST',
       body: JSON.stringify({
-        item_id:   item.id,
-        sku:       sku,
-        type:      'sale_online',
+        item_id:    item.id,
+        sku:        sku,
+        type:       'sale_online',
         qty_change: -qty,
-        notes:     'Venta tienda online GHL'
+        notes:      'Venta tienda online GHL'
       })
     });
   } catch (e) {
     console.warn('No se pudo registrar movimiento:', e.message);
   }
-
   return true;
 }
 
-// ─── Handler principal ────────────────────────────────────
 export default async function handler(req, res) {
-  // Solo POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Seguridad: verificar secret token
   const secret = req.headers['x-mora2-secret'];
   if (secret !== process.env.WEBHOOK_SECRET) {
     console.error('Webhook secret inválido');
@@ -77,36 +61,43 @@ export default async function handler(req, res) {
   }
 
   try {
-    const payload = req.body;
-    console.log('Webhook recibido:', JSON.stringify(payload, null, 2));
+    const p = req.body;
+    console.log('Webhook recibido:', JSON.stringify(p, null, 2));
 
-    // ── Extraer datos del pedido de GHL ──────────────────
-    // GHL manda los datos en diferentes estructuras según la versión
-    // Intentamos varias rutas comunes
-    const order = payload.order || payload.data || payload;
-    
-    const orderId       = order.id || order.orderId || order.order_id;
-    const customerName  = order.contactName || order.contact_name || 
-                          `${order.firstName || ''} ${order.lastName || ''}`.trim();
-    const customerEmail = order.email || order.contactEmail;
-    const customerPhone = order.phone || order.contactPhone || '';
-    const address       = order.address1 || order.shippingAddress?.address1 || '';
-    const city          = order.city || order.shippingAddress?.city || '';
-    const total         = parseFloat(order.amount || order.total || 0);
-    const paymentMethod = order.paymentMethod || order.payment_method || 'ghl';
-    const items         = order.items || order.lineItems || order.line_items || [];
-    const status        = order.status || 'pending';
+    // ── Extraer datos usando la estructura real del payload de GHL ──
+    const order = p.order || {};
+    const customer = order.customer || {};
 
-    // ── Construir cart para store_orders ─────────────────
-    const cart = items.map(item => ({
-      sku:       item.sku || item.product?.sku || '',
-      name:      item.name || item.product?.name || '',
-      qty:       parseInt(item.qty || item.quantity || 1),
-      salePrice: parseFloat(item.price || item.unitPrice || 0),
-      variant:   item.variant || `${item.options?.Corte || ''} / ${item.options?.Color || ''} / ${item.options?.Talla || ''}`
+    // ID de la orden — viene en line_items[0].meta.order_id
+    const orderId = order.line_items?.[0]?.meta?.order_id
+                 || order.id
+                 || p.contact_id
+                 || 'sin-id';
+
+    // Datos del cliente — vienen en order.customer y también en raíz del payload
+    const customerName  = customer.name  || p.full_name  || `${p.first_name || ''} ${p.last_name || ''}`.trim();
+    const customerEmail = customer.email || p.email || '';
+    const customerPhone = customer.phone || p.phone || '';
+    const address       = customer.full_address || p.full_address || p.address1 || '';
+    const city          = customer.city || p.city || '';
+
+    // Totales
+    const total = parseFloat(order.total_price || order.total_cart_price || 0);
+
+    // Método de pago
+    const paymentMethod = order.payment_gateway || 'manual';
+
+    // Line items
+    const lineItems = order.line_items || [];
+    const cart = lineItems.map(item => ({
+      sku:       item.sku || item.id || '',
+      name:      item.title || item.name || '',
+      qty:       parseInt(item.quantity || 1),
+      salePrice: parseFloat(item.price || 0),
+      variant:   item.title || ''   // GHL incluye variante en el title: "Soft Angel - Blanco / L / Fit"
     }));
 
-    // ── Crear registro en store_orders ───────────────────
+    // ── Insertar en store_orders ──────────────────────────
     const orderPayload = {
       customer_name:    customerName,
       customer_phone:   customerPhone,
@@ -117,9 +108,9 @@ export default async function handler(req, res) {
       delivery_fee:     0,
       total:            total,
       payment_method:   paymentMethod,
-      payment_ref:      String(orderId),
-      status:           mapStatus(status),
-      notes:            `Pedido GHL #${orderId} | Email: ${customerEmail}`,
+      payment_ref:      orderId,
+      status:           'pendiente_pago',
+      notes:            `Pedido GHL #${orderId} | Email: ${customerEmail} | Fecha: ${order.created_on || ''}`,
       whatsapp_sent:    false
     };
 
@@ -130,7 +121,7 @@ export default async function handler(req, res) {
 
     console.log(`✅ Pedido creado en Supabase: #${newOrder.id}`);
 
-    // ── Descontar stock por cada item ────────────────────
+    // ── Descontar stock ───────────────────────────────────
     const stockResults = [];
     for (const item of cart) {
       if (item.sku) {
@@ -147,21 +138,7 @@ export default async function handler(req, res) {
     });
 
   } catch (err) {
-    console.error('Error procesando webhook:', err);
+    console.error('Error procesando webhook:', err.message);
     return res.status(500).json({ error: err.message });
   }
-}
-
-// ─── Mapear status de GHL a mora2 ────────────────────────
-function mapStatus(ghlStatus) {
-  const map = {
-    'pending':    'pendiente_pago',
-    'paid':       'pago_recibido',
-    'processing': 'en_produccion',
-    'shipped':    'enviado',
-    'delivered':  'entregado',
-    'cancelled':  'cancelado',
-    'refunded':   'cancelado',
-  };
-  return map[ghlStatus?.toLowerCase()] || 'pendiente_pago';
 }
